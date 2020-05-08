@@ -1,53 +1,53 @@
-package daemon
+package daemon // import "github.com/docker/docker/daemon"
 
 import (
-	"strconv"
+	"context"
+	"fmt"
+	"time"
 
-	"github.com/docker/docker/engine"
+	libcontainerdtypes "github.com/docker/docker/libcontainerd/types"
 )
 
-func (daemon *Daemon) ContainerResize(job *engine.Job) engine.Status {
-	if len(job.Args) != 3 {
-		return job.Errorf("Not enough arguments. Usage: %s CONTAINER HEIGHT WIDTH\n", job.Name)
-	}
-	name := job.Args[0]
-	height, err := strconv.Atoi(job.Args[1])
+// ContainerResize changes the size of the TTY of the process running
+// in the container with the given name to the given height and width.
+func (daemon *Daemon) ContainerResize(name string, height, width int) error {
+	container, err := daemon.GetContainer(name)
 	if err != nil {
-		return job.Error(err)
-	}
-	width, err := strconv.Atoi(job.Args[2])
-	if err != nil {
-		return job.Error(err)
+		return err
 	}
 
-	if container := daemon.Get(name); container != nil {
-		if err := container.Resize(height, width); err != nil {
-			return job.Error(err)
-		}
-		return engine.StatusOK
+	if !container.IsRunning() {
+		return errNotRunning(container.ID)
 	}
-	return job.Errorf("No such container: %s", name)
+
+	if err = daemon.containerd.ResizeTerminal(context.Background(), container.ID, libcontainerdtypes.InitProcessName, width, height); err == nil {
+		attributes := map[string]string{
+			"height": fmt.Sprintf("%d", height),
+			"width":  fmt.Sprintf("%d", width),
+		}
+		daemon.LogContainerEventWithAttributes(container, "resize", attributes)
+	}
+	return err
 }
 
-func (daemon *Daemon) ContainerExecResize(job *engine.Job) engine.Status {
-	if len(job.Args) != 3 {
-		return job.Errorf("Not enough arguments. Usage: %s EXEC HEIGHT WIDTH\n", job.Name)
-	}
-	name := job.Args[0]
-	height, err := strconv.Atoi(job.Args[1])
+// ContainerExecResize changes the size of the TTY of the process
+// running in the exec with the given name to the given height and
+// width.
+func (daemon *Daemon) ContainerExecResize(name string, height, width int) error {
+	ec, err := daemon.getExecConfig(name)
 	if err != nil {
-		return job.Error(err)
+		return err
 	}
-	width, err := strconv.Atoi(job.Args[2])
-	if err != nil {
-		return job.Error(err)
+
+	// TODO: the timeout is hardcoded here, it would be more flexible to make it
+	// a parameter in resize request context, which would need API changes.
+	timeout := time.NewTimer(10 * time.Second)
+	defer timeout.Stop()
+
+	select {
+	case <-ec.Started:
+		return daemon.containerd.ResizeTerminal(context.Background(), ec.ContainerID, ec.ID, width, height)
+	case <-timeout.C:
+		return fmt.Errorf("timeout waiting for exec session ready")
 	}
-	execConfig, err := daemon.getExecConfig(name)
-	if err != nil {
-		return job.Error(err)
-	}
-	if err := execConfig.Resize(height, width); err != nil {
-		return job.Error(err)
-	}
-	return engine.StatusOK
 }

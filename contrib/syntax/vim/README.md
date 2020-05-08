@@ -3,21 +3,9 @@ dockerfile.vim
 
 Syntax highlighting for Dockerfiles
 
-Installation
-------------
+-------------------------------------------------------------------------------
 
-Via pathogen, the usual way...
+dockerfile.vim has been merged into upstream vim, and has therefore been deleted
+from here.  You can find the canonical version [here][1].
 
-Features
---------
-
-The syntax highlighting includes:
-
-* The directives (e.g. `FROM`)
-* Strings
-* Comments
-
-License
--------
-
-BSD, short and sweet
+[1]: https://github.com/vim/vim/blob/master/runtime/syntax/dockerfile.vim

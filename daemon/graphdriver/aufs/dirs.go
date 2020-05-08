@@ -1,4 +1,6 @@
-package aufs
+// +build linux
+
+package aufs // import "github.com/docker/docker/daemon/graphdriver/aufs"
 
 import (
 	"bufio"
@@ -13,7 +15,7 @@ func loadIds(root string) ([]string, error) {
 	if err != nil {
 		return nil, err
 	}
-	out := []string{}
+	var out []string
 	for _, d := range dirs {
 		if !d.IsDir() {
 			out = append(out, d.Name())
@@ -27,14 +29,14 @@ func loadIds(root string) ([]string, error) {
 //
 // If there are no lines in the file then the id has no parent
 // and an empty slice is returned.
-func getParentIds(root, id string) ([]string, error) {
+func getParentIDs(root, id string) ([]string, error) {
 	f, err := os.Open(path.Join(root, "layers", id))
 	if err != nil {
 		return nil, err
 	}
 	defer f.Close()
 
-	out := []string{}
+	var out []string
 	s := bufio.NewScanner(f)
 
 	for s.Scan() {
@@ -43,4 +45,20 @@ func getParentIds(root, id string) ([]string, error) {
 		}
 	}
 	return out, s.Err()
+}
+
+func (a *Driver) getMountpoint(id string) string {
+	return path.Join(a.mntPath(), id)
+}
+
+func (a *Driver) mntPath() string {
+	return path.Join(a.rootPath(), "mnt")
+}
+
+func (a *Driver) getDiffPath(id string) string {
+	return path.Join(a.diffPath(), id)
+}
+
+func (a *Driver) diffPath() string {
+	return path.Join(a.rootPath(), "diff")
 }

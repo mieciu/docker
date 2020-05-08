@@ -6,40 +6,68 @@
 # a CentOS image on CentOS).  See contrib/mkimage-rinse.sh for a way
 # to build CentOS images on other systems.
 
+set -e
+
 usage() {
-    cat <<EOOPTS
+	cat << EOOPTS
 $(basename $0) [OPTIONS] <name>
 OPTIONS:
-  -y <yumconf>  The path to the yum config to install packages from. The
-                default is /etc/yum.conf.
+  -p "<packages>"  The list of packages to install in the container.
+                   The default is blank. Can use multiple times.
+  -g "<groups>"    The groups of packages to install in the container.
+                   The default is "Core". Can use multiple times.
+  -y <yumconf>     The path to the yum config to install packages from. The
+                   default is /etc/yum.conf for Centos/RHEL and /etc/dnf/dnf.conf for Fedora
+  -t <tag>         Specify Tag information.
+                   default is reffered at /etc/{redhat,system}-release
 EOOPTS
-    exit 1
+	exit 1
 }
 
 # option defaults
 yum_config=/etc/yum.conf
-while getopts ":y:h" opt; do
-    case $opt in
-        y)
-            yum_config=$OPTARG
-            ;;
-        h)
-            usage
-            ;;
-        \?)
-            echo "Invalid option: -$OPTARG"
-            usage
-            ;;
-    esac
+if [ -f /etc/dnf/dnf.conf ] && command -v dnf &> /dev/null; then
+	yum_config=/etc/dnf/dnf.conf
+	alias yum=dnf
+fi
+# for names with spaces, use double quotes (") as install_groups=('Core' '"Compute Node"')
+install_groups=()
+install_packages=()
+version=
+while getopts ":y:p:g:t:h" opt; do
+	case $opt in
+		y)
+			yum_config=$OPTARG
+			;;
+		h)
+			usage
+			;;
+		p)
+			install_packages+=("$OPTARG")
+			;;
+		g)
+			install_groups+=("$OPTARG")
+			;;
+		t)
+			version="$OPTARG"
+			;;
+		\?)
+			echo "Invalid option: -$OPTARG"
+			usage
+			;;
+	esac
 done
 shift $((OPTIND - 1))
 name=$1
 
 if [[ -z $name ]]; then
-    usage
+	usage
 fi
 
-#--------------------
+# default to Core group if not specified otherwise
+if [ ${#install_groups[*]} -eq 0 ]; then
+	install_groups=('Core')
+fi
 
 target=$(mktemp -d --tmpdir $(basename $0).XXXXXX)
 
@@ -57,42 +85,63 @@ mknod -m 666 "$target"/dev/tty0 c 4 0
 mknod -m 666 "$target"/dev/urandom c 1 9
 mknod -m 666 "$target"/dev/zero c 1 5
 
-yum -c "$yum_config" --installroot="$target" --setopt=tsflags=nodocs \
-    --setopt=group_package_types=mandatory -y groupinstall Core
+# amazon linux yum will fail without vars set
+if [ -d /etc/yum/vars ]; then
+	mkdir -p -m 755 "$target"/etc/yum
+	cp -a /etc/yum/vars "$target"/etc/yum/
+fi
+
+if [[ -n "$install_groups" ]]; then
+	yum -c "$yum_config" --installroot="$target" --releasever=/ --setopt=tsflags=nodocs \
+		--setopt=group_package_types=mandatory -y groupinstall "${install_groups[@]}"
+fi
+
+if [[ -n "$install_packages" ]]; then
+	yum -c "$yum_config" --installroot="$target" --releasever=/ --setopt=tsflags=nodocs \
+		--setopt=group_package_types=mandatory -y install "${install_packages[@]}"
+fi
+
 yum -c "$yum_config" --installroot="$target" -y clean all
 
-cat > "$target"/etc/sysconfig/network <<EOF
+cat > "$target"/etc/sysconfig/network << EOF
 NETWORKING=yes
 HOSTNAME=localhost.localdomain
 EOF
 
-# effectively: febootstrap-minimize --keep-zoneinfo --keep-rpmdb
-# --keep-services "$target".  Stolen from mkimage-rinse.sh
+# effectively: febootstrap-minimize --keep-zoneinfo --keep-rpmdb --keep-services "$target".
 #  locales
 rm -rf "$target"/usr/{{lib,share}/locale,{lib,lib64}/gconv,bin/localedef,sbin/build-locale-archive}
-#  docs
+#  docs and man pages
 rm -rf "$target"/usr/share/{man,doc,info,gnome/help}
 #  cracklib
 rm -rf "$target"/usr/share/cracklib
 #  i18n
 rm -rf "$target"/usr/share/i18n
+#  yum cache
+rm -rf "$target"/var/cache/yum
+mkdir -p --mode=0755 "$target"/var/cache/yum
 #  sln
 rm -rf "$target"/sbin/sln
 #  ldconfig
-rm -rf "$target"/etc/ld.so.cache
-rm -rf "$target"/var/cache/ldconfig/*
+rm -rf "$target"/etc/ld.so.cache "$target"/var/cache/ldconfig
+mkdir -p --mode=0755 "$target"/var/cache/ldconfig
 
-version=
-if [ -r "$target"/etc/redhat-release ]; then
-    version="$(sed 's/^[^0-9\]*\([0-9.]\+\).*$/\1/' "$target"/etc/redhat-release)"
+if [ -z "$version" ]; then
+	for file in "$target"/etc/{redhat,system}-release; do
+		if [ -r "$file" ]; then
+			version="$(sed 's/^[^0-9\]*\([0-9.]\+\).*$/\1/' "$file")"
+			break
+		fi
+	done
 fi
 
 if [ -z "$version" ]; then
-    echo >&2 "warning: cannot autodetect OS version, using '$name' as tag"
-    version=$name
+	echo >&2 "warning: cannot autodetect OS version, using '$name' as tag"
+	version=$name
 fi
 
 tar --numeric-owner -c -C "$target" . | docker import - $name:$version
-docker run -i -t $name:$version echo success
+
+docker run -i -t --rm $name:$version /bin/bash -c 'echo success'
 
 rm -rf "$target"

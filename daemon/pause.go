@@ -1,37 +1,55 @@
-package daemon
+package daemon // import "github.com/docker/docker/daemon"
 
 import (
-	"github.com/docker/docker/engine"
+	"context"
+	"fmt"
+
+	"github.com/docker/docker/container"
+	"github.com/sirupsen/logrus"
 )
 
-func (daemon *Daemon) ContainerPause(job *engine.Job) engine.Status {
-	if len(job.Args) != 1 {
-		return job.Errorf("Usage: %s CONTAINER", job.Name)
+// ContainerPause pauses a container
+func (daemon *Daemon) ContainerPause(name string) error {
+	ctr, err := daemon.GetContainer(name)
+	if err != nil {
+		return err
 	}
-	name := job.Args[0]
-	container := daemon.Get(name)
-	if container == nil {
-		return job.Errorf("No such container: %s", name)
-	}
-	if err := container.Pause(); err != nil {
-		return job.Errorf("Cannot pause container %s: %s", name, err)
-	}
-	container.LogEvent("pause")
-	return engine.StatusOK
+	return daemon.containerPause(ctr)
 }
 
-func (daemon *Daemon) ContainerUnpause(job *engine.Job) engine.Status {
-	if n := len(job.Args); n < 1 || n > 2 {
-		return job.Errorf("Usage: %s CONTAINER", job.Name)
+// containerPause pauses the container execution without stopping the process.
+// The execution can be resumed by calling containerUnpause.
+func (daemon *Daemon) containerPause(container *container.Container) error {
+	container.Lock()
+	defer container.Unlock()
+
+	// We cannot Pause the container which is not running
+	if !container.Running {
+		return errNotRunning(container.ID)
 	}
-	name := job.Args[0]
-	container := daemon.Get(name)
-	if container == nil {
-		return job.Errorf("No such container: %s", name)
+
+	// We cannot Pause the container which is already paused
+	if container.Paused {
+		return errNotPaused(container.ID)
 	}
-	if err := container.Unpause(); err != nil {
-		return job.Errorf("Cannot unpause container %s: %s", name, err)
+
+	// We cannot Pause the container which is restarting
+	if container.Restarting {
+		return errContainerIsRestarting(container.ID)
 	}
-	container.LogEvent("unpause")
-	return engine.StatusOK
+
+	if err := daemon.containerd.Pause(context.Background(), container.ID); err != nil {
+		return fmt.Errorf("Cannot pause container %s: %s", container.ID, err)
+	}
+
+	container.Paused = true
+	daemon.setStateCounter(container)
+	daemon.updateHealthMonitor(container)
+	daemon.LogContainerEvent(container, "pause")
+
+	if err := container.CheckpointTo(daemon.containersReplica); err != nil {
+		logrus.WithError(err).Warn("could not save container to disk")
+	}
+
+	return nil
 }

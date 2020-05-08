@@ -1,19 +1,35 @@
-package tarsum
+// Package tarsum provides algorithms to perform checksum calculation on
+// filesystem layers.
+//
+// The transportation of filesystems, regarding Docker, is done with tar(1)
+// archives. There are a variety of tar serialization formats [2], and a key
+// concern here is ensuring a repeatable checksum given a set of inputs from a
+// generic tar archive. Types of transportation include distribution to and from a
+// registry endpoint, saving and loading through commands or Docker daemon APIs,
+// transferring the build context from client to Docker daemon, and committing the
+// filesystem of a container to become an image.
+//
+// As tar archives are used for transit, but not preserved in many situations, the
+// focus of the algorithm is to ensure the integrity of the preserved filesystem,
+// while maintaining a deterministic accountability. This includes neither
+// constraining the ordering or manipulation of the files during the creation or
+// unpacking of the archive, nor include additional metadata state about the file
+// system attributes.
+package tarsum // import "github.com/docker/docker/pkg/tarsum"
 
 import (
+	"archive/tar"
 	"bytes"
 	"compress/gzip"
+	"crypto"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
+	"fmt"
 	"hash"
 	"io"
-	"sort"
-	"strconv"
+	"path"
 	"strings"
-
-	"github.com/docker/docker/vendor/src/code.google.com/p/go/src/pkg/archive/tar"
-
-	"github.com/docker/docker/pkg/log"
 )
 
 const (
@@ -29,22 +45,47 @@ const (
 // including the byte payload of the image's json metadata as well, and for
 // calculating the checksums for buildcache.
 func NewTarSum(r io.Reader, dc bool, v Version) (TarSum, error) {
-	if _, ok := tarSumVersions[v]; !ok {
-		return nil, ErrVersionNotImplemented
-	}
-	return &tarSum{Reader: r, DisableCompression: dc, tarSumVersion: v}, nil
+	return NewTarSumHash(r, dc, v, DefaultTHash)
 }
 
-// Create a new TarSum, providing a THash to use rather than the DefaultTHash
+// NewTarSumHash creates a new TarSum, providing a THash to use rather than
+// the DefaultTHash.
 func NewTarSumHash(r io.Reader, dc bool, v Version, tHash THash) (TarSum, error) {
-	if _, ok := tarSumVersions[v]; !ok {
-		return nil, ErrVersionNotImplemented
+	headerSelector, err := getTarHeaderSelector(v)
+	if err != nil {
+		return nil, err
 	}
-	return &tarSum{Reader: r, DisableCompression: dc, tarSumVersion: v, tHash: tHash}, nil
+	ts := &tarSum{Reader: r, DisableCompression: dc, tarSumVersion: v, headerSelector: headerSelector, tHash: tHash}
+	err = ts.initTarSum()
+	return ts, err
+}
+
+// NewTarSumForLabel creates a new TarSum using the provided TarSum version+hash label.
+func NewTarSumForLabel(r io.Reader, disableCompression bool, label string) (TarSum, error) {
+	parts := strings.SplitN(label, "+", 2)
+	if len(parts) != 2 {
+		return nil, errors.New("tarsum label string should be of the form: {tarsum_version}+{hash_name}")
+	}
+
+	versionName, hashName := parts[0], parts[1]
+
+	version, ok := tarSumVersionsByName[versionName]
+	if !ok {
+		return nil, fmt.Errorf("unknown TarSum version name: %q", versionName)
+	}
+
+	hashConfig, ok := standardHashConfigs[hashName]
+	if !ok {
+		return nil, fmt.Errorf("unknown TarSum hash name: %q", hashName)
+	}
+
+	tHash := NewTHash(hashConfig.name, hashConfig.hash.New)
+
+	return NewTarSumHash(r, disableCompression, version, tHash)
 }
 
 // TarSum is the generic interface for calculating fixed time
-// checksums of a tar archive
+// checksums of a tar archive.
 type TarSum interface {
 	io.Reader
 	GetSums() FileInfoSums
@@ -53,7 +94,7 @@ type TarSum interface {
 	Hash() THash
 }
 
-// tarSum struct is the structure for a Version0 checksum calculation
+// tarSum struct is the structure for a Version0 checksum calculation.
 type tarSum struct {
 	io.Reader
 	tarR               *tar.Reader
@@ -69,8 +110,9 @@ type tarSum struct {
 	currentFile        string
 	finished           bool
 	first              bool
-	DisableCompression bool    // false by default. When false, the output gzip compressed.
-	tarSumVersion      Version // this field is not exported so it can not be mutated during use
+	DisableCompression bool              // false by default. When false, the output gzip compressed.
+	tarSumVersion      Version           // this field is not exported so it can not be mutated during use
+	headerSelector     tarHeaderSelector // handles selecting and ordering headers for files in the archive
 }
 
 func (ts tarSum) Hash() THash {
@@ -81,18 +123,31 @@ func (ts tarSum) Version() Version {
 	return ts.tarSumVersion
 }
 
-// A hash.Hash type generator and its name
+// THash provides a hash.Hash type generator and its name.
 type THash interface {
 	Hash() hash.Hash
 	Name() string
 }
 
-// Convenience method for creating a THash
+// NewTHash is a convenience method for creating a THash.
 func NewTHash(name string, h func() hash.Hash) THash {
 	return simpleTHash{n: name, h: h}
 }
 
-// TarSum default is "sha256"
+type tHashConfig struct {
+	name string
+	hash crypto.Hash
+}
+
+var (
+	// NOTE: DO NOT include MD5 or SHA1, which are considered insecure.
+	standardHashConfigs = map[string]tHashConfig{
+		"sha256": {name: "sha256", hash: crypto.SHA256},
+		"sha512": {name: "sha512", hash: crypto.SHA512},
+	}
+)
+
+// DefaultTHash is default TarSum hashing algorithm - "sha256".
 var DefaultTHash = NewTHash("sha256", sha256.New)
 
 type simpleTHash struct {
@@ -103,47 +158,15 @@ type simpleTHash struct {
 func (sth simpleTHash) Name() string    { return sth.n }
 func (sth simpleTHash) Hash() hash.Hash { return sth.h() }
 
-func (ts tarSum) selectHeaders(h *tar.Header, v Version) (set [][2]string) {
-	for _, elem := range [][2]string{
-		{"name", h.Name},
-		{"mode", strconv.Itoa(int(h.Mode))},
-		{"uid", strconv.Itoa(h.Uid)},
-		{"gid", strconv.Itoa(h.Gid)},
-		{"size", strconv.Itoa(int(h.Size))},
-		{"mtime", strconv.Itoa(int(h.ModTime.UTC().Unix()))},
-		{"typeflag", string([]byte{h.Typeflag})},
-		{"linkname", h.Linkname},
-		{"uname", h.Uname},
-		{"gname", h.Gname},
-		{"devmajor", strconv.Itoa(int(h.Devmajor))},
-		{"devminor", strconv.Itoa(int(h.Devminor))},
-	} {
-		if v >= VersionDev && elem[0] == "mtime" {
-			continue
-		}
-		set = append(set, elem)
-	}
-	return
-}
-
 func (ts *tarSum) encodeHeader(h *tar.Header) error {
-	for _, elem := range ts.selectHeaders(h, ts.Version()) {
+	for _, elem := range ts.headerSelector.selectHeaders(h) {
+		// Ignore these headers to be compatible with versions
+		// before go 1.10
+		if elem[0] == "gname" || elem[0] == "uname" {
+			elem[1] = ""
+		}
 		if _, err := ts.h.Write([]byte(elem[0] + elem[1])); err != nil {
 			return err
-		}
-	}
-
-	// include the additional pax headers, from an ordered list
-	if ts.Version() >= VersionDev {
-		var keys []string
-		for k := range h.Xattrs {
-			keys = append(keys, k)
-		}
-		sort.Strings(keys)
-		for _, k := range keys {
-			if _, err := ts.h.Write([]byte(k + h.Xattrs[k])); err != nil {
-				return err
-			}
 		}
 	}
 	return nil
@@ -170,12 +193,6 @@ func (ts *tarSum) initTarSum() error {
 }
 
 func (ts *tarSum) Read(buf []byte) (int, error) {
-	if ts.writer == nil {
-		if err := ts.initTarSum(); err != nil {
-			return 0, err
-		}
-	}
-
 	if ts.finished {
 		return ts.bufWriter.Read(buf)
 	}
@@ -207,6 +224,10 @@ func (ts *tarSum) Read(buf []byte) (int, error) {
 				ts.first = false
 			}
 
+			if _, err := ts.tarW.Write(buf2[:n]); err != nil {
+				return 0, err
+			}
+
 			currentHeader, err := ts.tarR.Next()
 			if err != nil {
 				if err == io.EOF {
@@ -220,21 +241,19 @@ func (ts *tarSum) Read(buf []byte) (int, error) {
 						return 0, err
 					}
 					ts.finished = true
-					return n, nil
+					return ts.bufWriter.Read(buf)
 				}
-				return n, err
+				return 0, err
 			}
-			ts.currentFile = strings.TrimSuffix(strings.TrimPrefix(currentHeader.Name, "./"), "/")
+
+			ts.currentFile = path.Join(".", path.Join("/", currentHeader.Name))
 			if err := ts.encodeHeader(currentHeader); err != nil {
 				return 0, err
 			}
 			if err := ts.tarW.WriteHeader(currentHeader); err != nil {
 				return 0, err
 			}
-			if _, err := ts.tarW.Write(buf2[:n]); err != nil {
-				return 0, err
-			}
-			ts.tarW.Flush()
+
 			if _, err := io.Copy(ts.writer, ts.bufTar); err != nil {
 				return 0, err
 			}
@@ -242,7 +261,7 @@ func (ts *tarSum) Read(buf []byte) (int, error) {
 
 			return ts.bufWriter.Read(buf)
 		}
-		return n, err
+		return 0, err
 	}
 
 	// Filling the hash buffer
@@ -250,11 +269,10 @@ func (ts *tarSum) Read(buf []byte) (int, error) {
 		return 0, err
 	}
 
-	// Filling the tar writter
+	// Filling the tar writer
 	if _, err = ts.tarW.Write(buf2[:n]); err != nil {
 		return 0, err
 	}
-	ts.tarW.Flush()
 
 	// Filling the output writer
 	if _, err = io.Copy(ts.writer, ts.bufTar); err != nil {
@@ -272,11 +290,9 @@ func (ts *tarSum) Sum(extra []byte) string {
 		h.Write(extra)
 	}
 	for _, fis := range ts.sums {
-		log.Debugf("-->%s<--", fis.Sum())
 		h.Write([]byte(fis.Sum()))
 	}
 	checksum := ts.Version().String() + "+" + ts.tHash.Name() + ":" + hex.EncodeToString(h.Sum(nil))
-	log.Debugf("checksum processed: %s", checksum)
 	return checksum
 }
 

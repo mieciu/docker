@@ -1,272 +1,188 @@
-package daemon
+package daemon // import "github.com/docker/docker/daemon"
 
 import (
-	"encoding/json"
+	"context"
+	"fmt"
 	"io"
-	"os"
-	"time"
 
-	"github.com/docker/docker/engine"
-	"github.com/docker/docker/pkg/ioutils"
-	"github.com/docker/docker/pkg/jsonlog"
-	"github.com/docker/docker/pkg/log"
-	"github.com/docker/docker/utils"
+	"github.com/docker/docker/api/types/backend"
+	"github.com/docker/docker/container"
+	"github.com/docker/docker/container/stream"
+	"github.com/docker/docker/daemon/logger"
+	"github.com/docker/docker/errdefs"
+	"github.com/docker/docker/pkg/stdcopy"
+	"github.com/moby/term"
+	"github.com/pkg/errors"
+	"github.com/sirupsen/logrus"
 )
 
-func (daemon *Daemon) ContainerAttach(job *engine.Job) engine.Status {
-	if len(job.Args) != 1 {
-		return job.Errorf("Usage: %s CONTAINER\n", job.Name)
-	}
-
-	var (
-		name   = job.Args[0]
-		logs   = job.GetenvBool("logs")
-		stream = job.GetenvBool("stream")
-		stdin  = job.GetenvBool("stdin")
-		stdout = job.GetenvBool("stdout")
-		stderr = job.GetenvBool("stderr")
-	)
-
-	container := daemon.Get(name)
-	if container == nil {
-		return job.Errorf("No such container: %s", name)
-	}
-
-	//logs
-	if logs {
-		cLog, err := container.ReadLog("json")
-		if err != nil && os.IsNotExist(err) {
-			// Legacy logs
-			log.Debugf("Old logs format")
-			if stdout {
-				cLog, err := container.ReadLog("stdout")
-				if err != nil {
-					log.Errorf("Error reading logs (stdout): %s", err)
-				} else if _, err := io.Copy(job.Stdout, cLog); err != nil {
-					log.Errorf("Error streaming logs (stdout): %s", err)
-				}
-			}
-			if stderr {
-				cLog, err := container.ReadLog("stderr")
-				if err != nil {
-					log.Errorf("Error reading logs (stderr): %s", err)
-				} else if _, err := io.Copy(job.Stderr, cLog); err != nil {
-					log.Errorf("Error streaming logs (stderr): %s", err)
-				}
-			}
-		} else if err != nil {
-			log.Errorf("Error reading logs (json): %s", err)
-		} else {
-			dec := json.NewDecoder(cLog)
-			for {
-				l := &jsonlog.JSONLog{}
-
-				if err := dec.Decode(l); err == io.EOF {
-					break
-				} else if err != nil {
-					log.Errorf("Error streaming logs: %s", err)
-					break
-				}
-				if l.Stream == "stdout" && stdout {
-					io.WriteString(job.Stdout, l.Log)
-				}
-				if l.Stream == "stderr" && stderr {
-					io.WriteString(job.Stderr, l.Log)
-				}
-			}
+// ContainerAttach attaches to logs according to the config passed in. See ContainerAttachConfig.
+func (daemon *Daemon) ContainerAttach(prefixOrName string, c *backend.ContainerAttachConfig) error {
+	keys := []byte{}
+	var err error
+	if c.DetachKeys != "" {
+		keys, err = term.ToBytes(c.DetachKeys)
+		if err != nil {
+			return errdefs.InvalidParameter(errors.Errorf("Invalid detach keys (%s) provided", c.DetachKeys))
 		}
 	}
 
-	//stream
-	if stream {
-		var (
-			cStdin           io.ReadCloser
-			cStdout, cStderr io.Writer
-			cStdinCloser     io.Closer
-		)
-
-		if stdin {
-			r, w := io.Pipe()
-			go func() {
-				defer w.Close()
-				defer log.Debugf("Closing buffered stdin pipe")
-				io.Copy(w, job.Stdin)
-			}()
-			cStdin = r
-			cStdinCloser = job.Stdin
-		}
-		if stdout {
-			cStdout = job.Stdout
-		}
-		if stderr {
-			cStderr = job.Stderr
-		}
-
-		<-daemon.Attach(&container.StreamConfig, container.Config.OpenStdin, container.Config.StdinOnce, container.Config.Tty, cStdin, cStdinCloser, cStdout, cStderr)
-		// If we are in stdinonce mode, wait for the process to end
-		// otherwise, simply return
-		if container.Config.StdinOnce && !container.Config.Tty {
-			container.WaitStop(-1 * time.Second)
-		}
+	ctr, err := daemon.GetContainer(prefixOrName)
+	if err != nil {
+		return err
 	}
-	return engine.StatusOK
+	if ctr.IsPaused() {
+		err := fmt.Errorf("container %s is paused, unpause the container before attach", prefixOrName)
+		return errdefs.Conflict(err)
+	}
+	if ctr.IsRestarting() {
+		err := fmt.Errorf("container %s is restarting, wait until the container is running", prefixOrName)
+		return errdefs.Conflict(err)
+	}
+
+	cfg := stream.AttachConfig{
+		UseStdin:   c.UseStdin,
+		UseStdout:  c.UseStdout,
+		UseStderr:  c.UseStderr,
+		TTY:        ctr.Config.Tty,
+		CloseStdin: ctr.Config.StdinOnce,
+		DetachKeys: keys,
+	}
+	ctr.StreamConfig.AttachStreams(&cfg)
+
+	inStream, outStream, errStream, err := c.GetStreams()
+	if err != nil {
+		return err
+	}
+	defer inStream.Close()
+
+	if !ctr.Config.Tty && c.MuxStreams {
+		errStream = stdcopy.NewStdWriter(errStream, stdcopy.Stderr)
+		outStream = stdcopy.NewStdWriter(outStream, stdcopy.Stdout)
+	}
+
+	if cfg.UseStdin {
+		cfg.Stdin = inStream
+	}
+	if cfg.UseStdout {
+		cfg.Stdout = outStream
+	}
+	if cfg.UseStderr {
+		cfg.Stderr = errStream
+	}
+
+	if err := daemon.containerAttach(ctr, &cfg, c.Logs, c.Stream); err != nil {
+		fmt.Fprintf(outStream, "Error attaching: %s\n", err)
+	}
+	return nil
 }
 
-// FIXME: this should be private, and every outside subsystem
-// should go through the "container_attach" job. But that would require
-// that job to be properly documented, as well as the relationship betweem
-// Attach and ContainerAttach.
-//
-// This method is in use by builder/builder.go.
-func (daemon *Daemon) Attach(streamConfig *StreamConfig, openStdin, stdinOnce, tty bool, stdin io.ReadCloser, stdinCloser io.Closer, stdout io.Writer, stderr io.Writer) chan error {
-	var (
-		cStdout, cStderr io.ReadCloser
-		nJobs            int
-		errors           = make(chan error, 3)
-	)
-
-	// Connect stdin of container to the http conn.
-	if stdin != nil && openStdin {
-		nJobs++
-		// Get the stdin pipe.
-		if cStdin, err := streamConfig.StdinPipe(); err != nil {
-			errors <- err
-		} else {
-			go func() {
-				log.Debugf("attach: stdin: begin")
-				defer log.Debugf("attach: stdin: end")
-				// No matter what, when stdin is closed (io.Copy unblock), close stdout and stderr
-				if stdinOnce && !tty {
-					defer cStdin.Close()
-				} else {
-					defer func() {
-						if cStdout != nil {
-							cStdout.Close()
-						}
-						if cStderr != nil {
-							cStderr.Close()
-						}
-					}()
-				}
-				if tty {
-					_, err = utils.CopyEscapable(cStdin, stdin)
-				} else {
-					_, err = io.Copy(cStdin, stdin)
-
-				}
-				if err == io.ErrClosedPipe {
-					err = nil
-				}
-				if err != nil {
-					log.Errorf("attach: stdin: %s", err)
-				}
-				errors <- err
-			}()
-		}
+// ContainerAttachRaw attaches the provided streams to the container's stdio
+func (daemon *Daemon) ContainerAttachRaw(prefixOrName string, stdin io.ReadCloser, stdout, stderr io.Writer, doStream bool, attached chan struct{}) error {
+	ctr, err := daemon.GetContainer(prefixOrName)
+	if err != nil {
+		return err
 	}
-	if stdout != nil {
-		nJobs++
-		// Get a reader end of a pipe that is attached as stdout to the container.
-		if p, err := streamConfig.StdoutPipe(); err != nil {
-			errors <- err
-		} else {
-			cStdout = p
-			go func() {
-				log.Debugf("attach: stdout: begin")
-				defer log.Debugf("attach: stdout: end")
-				// If we are in StdinOnce mode, then close stdin
-				if stdinOnce && stdin != nil {
-					defer stdin.Close()
-				}
-				if stdinCloser != nil {
-					defer stdinCloser.Close()
-				}
-				_, err := io.Copy(stdout, cStdout)
-				if err == io.ErrClosedPipe {
-					err = nil
-				}
-				if err != nil {
-					log.Errorf("attach: stdout: %s", err)
-				}
-				errors <- err
-			}()
-		}
-	} else {
-		// Point stdout of container to a no-op writer.
-		go func() {
-			if stdinCloser != nil {
-				defer stdinCloser.Close()
-			}
-			if cStdout, err := streamConfig.StdoutPipe(); err != nil {
-				log.Errorf("attach: stdout pipe: %s", err)
-			} else {
-				io.Copy(&ioutils.NopWriter{}, cStdout)
-			}
-		}()
+	cfg := stream.AttachConfig{
+		UseStdin:   stdin != nil,
+		UseStdout:  stdout != nil,
+		UseStderr:  stderr != nil,
+		TTY:        ctr.Config.Tty,
+		CloseStdin: ctr.Config.StdinOnce,
 	}
-	if stderr != nil {
-		nJobs++
-		if p, err := streamConfig.StderrPipe(); err != nil {
-			errors <- err
-		} else {
-			cStderr = p
-			go func() {
-				log.Debugf("attach: stderr: begin")
-				defer log.Debugf("attach: stderr: end")
-				// If we are in StdinOnce mode, then close stdin
-				// Why are we closing stdin here and above while handling stdout?
-				if stdinOnce && stdin != nil {
-					defer stdin.Close()
-				}
-				if stdinCloser != nil {
-					defer stdinCloser.Close()
-				}
-				_, err := io.Copy(stderr, cStderr)
-				if err == io.ErrClosedPipe {
-					err = nil
-				}
-				if err != nil {
-					log.Errorf("attach: stderr: %s", err)
-				}
-				errors <- err
-			}()
-		}
-	} else {
-		// Point stderr at a no-op writer.
-		go func() {
-			if stdinCloser != nil {
-				defer stdinCloser.Close()
-			}
-
-			if cStderr, err := streamConfig.StderrPipe(); err != nil {
-				log.Errorf("attach: stdout pipe: %s", err)
-			} else {
-				io.Copy(&ioutils.NopWriter{}, cStderr)
-			}
-		}()
+	ctr.StreamConfig.AttachStreams(&cfg)
+	close(attached)
+	if cfg.UseStdin {
+		cfg.Stdin = stdin
+	}
+	if cfg.UseStdout {
+		cfg.Stdout = stdout
+	}
+	if cfg.UseStderr {
+		cfg.Stderr = stderr
 	}
 
-	return utils.Go(func() error {
-		defer func() {
-			if cStdout != nil {
-				cStdout.Close()
-			}
-			if cStderr != nil {
-				cStderr.Close()
-			}
-		}()
+	return daemon.containerAttach(ctr, &cfg, false, doStream)
+}
 
-		// FIXME: how to clean up the stdin goroutine without the unwanted side effect
-		// of closing the passed stdin? Add an intermediary io.Pipe?
-		for i := 0; i < nJobs; i++ {
-			log.Debugf("attach: waiting for job %d/%d", i+1, nJobs)
-			if err := <-errors; err != nil {
-				log.Errorf("attach: job %d returned error %s, aborting all jobs", i+1, err)
-				return err
-			}
-			log.Debugf("attach: job %d completed successfully", i+1)
+func (daemon *Daemon) containerAttach(c *container.Container, cfg *stream.AttachConfig, logs, doStream bool) error {
+	if logs {
+		logDriver, logCreated, err := daemon.getLogger(c)
+		if err != nil {
+			return err
 		}
-		log.Debugf("attach: all jobs completed successfully")
+		if logCreated {
+			defer func() {
+				if err = logDriver.Close(); err != nil {
+					logrus.Errorf("Error closing logger: %v", err)
+				}
+			}()
+		}
+		cLog, ok := logDriver.(logger.LogReader)
+		if !ok {
+			return logger.ErrReadLogsNotSupported{}
+		}
+		logs := cLog.ReadLogs(logger.ReadConfig{Tail: -1})
+		defer logs.ConsumerGone()
+
+	LogLoop:
+		for {
+			select {
+			case msg, ok := <-logs.Msg:
+				if !ok {
+					break LogLoop
+				}
+				if msg.Source == "stdout" && cfg.Stdout != nil {
+					cfg.Stdout.Write(msg.Line)
+				}
+				if msg.Source == "stderr" && cfg.Stderr != nil {
+					cfg.Stderr.Write(msg.Line)
+				}
+			case err := <-logs.Err:
+				logrus.Errorf("Error streaming logs: %v", err)
+				break LogLoop
+			}
+		}
+	}
+
+	daemon.LogContainerEvent(c, "attach")
+
+	if !doStream {
 		return nil
-	})
+	}
+
+	if cfg.Stdin != nil {
+		r, w := io.Pipe()
+		go func(stdin io.ReadCloser) {
+			defer w.Close()
+			defer logrus.Debug("Closing buffered stdin pipe")
+			io.Copy(w, stdin)
+		}(cfg.Stdin)
+		cfg.Stdin = r
+	}
+
+	if !c.Config.OpenStdin {
+		cfg.Stdin = nil
+	}
+
+	if c.Config.StdinOnce && !c.Config.Tty {
+		// Wait for the container to stop before returning.
+		waitChan := c.Wait(context.Background(), container.WaitConditionNotRunning)
+		defer func() {
+			<-waitChan // Ignore returned exit code.
+		}()
+	}
+
+	ctx := c.InitAttachContext()
+	err := <-c.StreamConfig.CopyStreams(ctx, cfg)
+	if err != nil {
+		var ierr term.EscapeError
+		if errors.Is(err, context.Canceled) || errors.As(err, &ierr) {
+			daemon.LogContainerEvent(c, "detach")
+		} else {
+			logrus.Errorf("attach failed with error: %v", err)
+		}
+	}
+
+	return nil
 }
